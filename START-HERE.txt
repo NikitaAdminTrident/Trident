@@ -1,3 +1,7 @@
+LOCAL DEVELOPMENT IS NOW AVAILABLE
+See LOCAL-DEVELOPMENT.txt and double-click Start-Local-Development.cmd.
+The local preview uses separate storage. Existing deployment instructions follow.
+
 VERSION C - ONLINE SETUP
 
 WHAT IS READY

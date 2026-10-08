@@ -2,6 +2,10 @@ import base64,io,json,logging,os
 from urllib.parse import parse_qs
 from core import Problem,decode,save_quote,workbook_info
 from storage import BigQueryStore,CloudObjects
+import timesheets
+import vehicles
+import leave
+import quote_settings
 MAX_BODY=40*1024*1024
 OWNER='nikita.trident2024@gmail.com'
 def google_user(token):
@@ -34,21 +38,55 @@ class Application:
      if self.store is None:self.store=BigQueryStore()
      if self.objects is None:self.objects=CloudObjects()
      revision,state=self.store.read();headers.append(('ETag',f'"{revision}"'))
-     if path=='/api/catalog' and method=='GET':payload={'quotes':list(state['quotes'].values()),'pdfs':list(state['pdfs'])}
+     if path=='/api/timesheets/config' and method=='GET':payload=timesheets.config(state)
+     elif path=='/api/staff-settings' and method=='GET':payload=timesheets.settings(state)
+     elif path=='/api/time-settings' and method=='GET':payload=state.get('timeSettings',{'start':'08:00','finish':'16:00'})
+     elif path=='/api/quote-settings' and method=='GET':payload=quote_settings.read(state)
+     elif path=='/api/leave' and method=='GET':payload={'requests':list(state.get('leaveRequests',{}).values()),'technicians':timesheets.settings(state)['technicians']}
+     elif path=='/api/vehicles' and method=='GET':payload={'vehicles':vehicles.fleet(state),'removedVehicles':list(state.get('removedVehicles',{}).values()),'checks':list(state.get('vehicleChecks',{}).values()),'technicians':timesheets.settings(state)['technicians'],'checklist':vehicles.CHECKLIST}
+     elif path=='/api/timesheets' and method=='GET':payload={'timesheets':list(state.get('timesheets',{}).values())}
+     elif path=='/api/catalog' and method=='GET':payload={'quotes':list(state['quotes'].values()),'pdfs':list(state['pdfs'])}
      elif path=='/api/drafts' and method=='GET':payload={'drafts':[]}
      elif path=='/api/workbook' and method=='GET':payload=decode(state['workbook'],10*1024*1024);mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
      elif path=='/api/pdf' and method=='GET':
       name=parse_qs(environ.get('QUERY_STRING','')).get('name',[''])[0];key=state['pdfs'].get(name)
       if not key:raise Problem(404,'This PDF is unavailable or has been deleted.')
       payload=self.objects.get(key);mime='application/pdf'
-     elif method=='POST' and path in ('/api/workbook','/api/quote-save'):
-      if environ.get('HTTP_IF_MATCH')!=f'"{revision}"':raise Problem(409,'Another quote or Excel edit was saved. Refresh and try again.')
+     elif method=='POST' and path in ('/api/workbook','/api/quote-save','/api/timesheets','/api/staff-settings','/api/vehicles','/api/vehicle-checks','/api/leave','/api/leave-decision','/api/time-settings','/api/quote-settings'):
+      if environ.get('HTTP_IF_MATCH')!=f'"{revision}"':raise Problem(409,'Another change was saved. Refresh and try again.')
       length=int(environ.get('CONTENT_LENGTH') or 0)
       if length<1 or length>MAX_BODY:raise Problem(400,'Upload exceeds the allowed size.')
       body=environ['wsgi.input'].read(length)
       if len(body)!=length:raise Problem(400,'Incomplete upload.')
       upload=None;garbage=[]
-      if path=='/api/workbook':
+      if path in ('/api/time-settings','/api/quote-settings'):
+       try:p=json.loads(body)
+       except Exception:raise Problem(400,'Invalid settings request.')
+       if path=='/api/quote-settings':state=quote_settings.save(state,p)
+       else:
+        if not isinstance(p,dict) or timesheets.minutes(p.get('finish'))<=timesheets.minutes(p.get('start')):raise Problem(400,'Default finish time must be after start time, in 15-minute increments.')
+        state['timeSettings']={'start':p['start'],'finish':p['finish']}
+       payload={'saved':True}
+      elif path in ('/api/leave','/api/leave-decision'):
+       try:p=json.loads(body)
+       except Exception:raise Problem(400,'Invalid leave request.')
+       if path=='/api/leave':state,entry=leave.create(state,p)
+       else:state,entry=leave.decide(state,p,email)
+       payload={'saved':True,'request':entry}
+      elif path in ('/api/vehicles','/api/vehicle-checks'):
+       try:p=json.loads(body)
+       except Exception:raise Problem(400,'Invalid vehicle request.')
+       if path=='/api/vehicles':state=vehicles.save_fleet(state,p);payload={'saved':True}
+       else:state,entry=vehicles.save_check(state,p);payload={'saved':True,'check':entry}
+      elif path=='/api/staff-settings':
+       try:p=json.loads(body)
+       except Exception:raise Problem(400,'Invalid settings request.')
+       state=timesheets.save_settings(state,p);payload={'saved':True}
+      elif path=='/api/timesheets':
+       try:p=json.loads(body)
+       except Exception:raise Problem(400,'Invalid time sheet request.')
+       state,entry=timesheets.save(state,p);payload={'saved':True,'id':entry['id'],'total':entry['total'],'message':'Signed time sheet saved.'}
+      elif path=='/api/workbook':
        if len(body)>10*1024*1024:raise Problem(400,'Workbook exceeds 10 MB.')
        _,old=workbook_info(decode(state['workbook'],10*1024*1024));_,new=workbook_info(body)
        if not set(old).issubset(new):raise Problem(400,'Keep all existing quote numbers, including deleted numbers, in the workbook.')
